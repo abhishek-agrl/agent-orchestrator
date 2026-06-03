@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Bind mount the host directory for live code reloading
+      - .:/app
+      # Do not overwrite the container-built SQLite DB file if you want the host one
+      - ./agent_orc_platform.db:/app/agent_orc_platform.db
+    # Override CMD to run with --reload for hot-reloading
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      # Bind mount the frontend directory for Hot Module Replacement (HMR)
+      - ./frontend:/app
+      # Prevent node_modules from being overwritten by host directory
+      - /app/node_modules
+    depends_on:
+      - backend
+    restart: unless-stopped
