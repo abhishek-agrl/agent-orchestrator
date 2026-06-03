@@ -24,7 +24,7 @@ graph TD
         DB[(SQLite DB)] <--> API
         API <--> Runtime[Step-by-Step Runtime Engine]
         Runtime <--> CrewAI[crewAI Multi-Agent Core]
-        CrewAI <--> Adapter[LangChain BaseLLM Adapter]
+        Runtime <--> Adapter[LangChain BaseLLM Adapter]
         Adapter <--> LLM[Google GenAI API: gemma-4-26b-a4b-it]
     end
 
@@ -42,71 +42,118 @@ graph TD
 ```
 
 ### 1. Presentation Layer (Frontend React Client)
-* **Visual Canvas (`WorkflowBuilder.jsx`)**: Built on top of `React Flow`. It provides drag-and-drop node initialization, dynamic edge connection representing step dependencies, node selection for internal overrides, and templates pre-seeding.
+* **Visual Canvas (`WorkflowBuilder.jsx`)**: Built on top of `React Flow`. It provides drag-and-drop node initialization, dynamic edge connection representing step dependencies, node selection for internal overrides, and pre-seeded templates.
 * **Floating Execution Tracing**: Captures real-time Server-Sent Events (SSE) from the backend to display step outputs, active status indicators, and pause states.
 * **Telemetry Observation Grid**: Provides live summaries of execution times, token usage, cost metrics, and full logs of agent internal dialogues.
 
 ### 2. Application Layer (FastAPI API Gateway)
-* **CRUD Endpoints**: Manage agent configurations and workflows using SQLAlchemy ORM.
+* **CRUD Endpoints (`routers/agents.py`)**: Manage agent configurations and workflows using SQLAlchemy ORM.
 * **Real-time Event Stream (SSE)**: Formulates a streaming response generator via FastAPI's `StreamingResponse`, yielding agent outputs as they are generated.
 * **Persistent History Logger**: Persists conversation message threads (`models.Message`) so both UI sandbox sessions and Telegram interactions stay synchronized.
 
 ### 3. Agent Runtime Layer (crewAI & Adapter)
-* **Agent Initialization**: Spawns crewAI agent instances from database models, injecting their backstories with configured skills, interaction rules, and guardrails to ensure compliance.
+* **Agent Initialization (`runtime.py`)**: Spawns crewAI agent instances from database models, injecting their backstories with configured skills, interaction rules, and guardrails to ensure compliance.
 * **Adapter Pattern (`LangChainBaseLLM`)**: Adapts crewAI's custom `BaseLLM` interface to wrap LangChain's `ChatGoogleGenerativeAI`. This resolves Pydantic validation mismatches and ensures compatibility with strict developer API requirements (model restricted to `gemma-4-26b-a4b-it`).
 * **Tool Bindings**: Connects agents to executable python tools (web search scraper, itinerary schedulers, and calendar link publishers).
+* **Backstory Adaptation**: Automatically adapts the backstory of travel agents when mapped to other domains (e.g. recruitment/scheduling) by appending a dynamic override prompt instructing the model how to reuse travel tools for new tasks.
 
 ### 4. Integration Layer (Telegram Bot)
-* **Background Daemon**: A background polling loop client listening for incoming chat updates.
+* **Background Daemon (`telegram_bot.py`)**: A background polling loop client listening for incoming chat updates.
 * **Context Routing**: Intercepts Telegram queries, checks for the active database workflow, and routes inputs through the step-by-step executor.
 
 ---
 
-## 🛠️ Technical Decisions & Tradeoffs
+## 💾 Relational Persistence (SQLite DB Schema)
 
-During development, we evaluated several technical architectures and frameworks. Below is the justification for our library and package choices, directly addressing performance, complexity, and local delivery constraints:
+The SQLite database (`agent_orc_platform.db`) maintains all configurations, logs, and workflow states. The mapping is managed via SQLAlchemy ORM in [models.py](file:///Users/abhishek/Developer/agent-orchestrator/models.py):
 
-### 1. Agent Framework: crewAI vs. LangGraph vs. AutoGen
-*   **Why crewAI?**
-    *   **Abstraction and Role-playing**: crewAI is explicitly optimized for role-play orchestration. It provides first-class properties for `backstory`, `goal`, and `role`, making it easy to map database-seeded agents into fully realized LLM personas.
-    *   **Time-to-Workflow Efficiency**: Unlike **LangGraph** (which is a low-level state-chart framework requiring manual state reducer, node, and edge wiring in Python code), crewAI allows us to dynamically compile and run a sequential crew of agents from database templates in a few lines of code. This dramatically reduced the *time from zero to a working multi-agent workflow*.
-    *   **Structured Sequencing**: Unlike **AutoGen** (which is highly chat-centric and prone to conversational loops/hallucinations), crewAI's sequential process makes it easy to enforce strict execution boundaries (e.g. Travel Searching ➡️ Booking ➡️ Scheduling), which is crucial for deterministic business workflows.
-
-### 2. Backend Gateway: FastAPI
-*   **Asynchronous Support**: FastAPI natively supports asynchronous execution (via Starlette and pydantic), enabling the background Telegram bot thread and FastAPI web endpoints to share resources concurrently without blocking requests.
-*   **Real-time Event Streaming**: FastAPI provides `StreamingResponse` out of the box. This allowed us to build a Server-Sent Events (SSE) gateway that streams live agent terminal logs and step-by-step outputs to the UI, assuring the user that the background execution is active.
-
-### 3. Visual Layer: React Flow
-*   **Canvas Orchestration**: React Flow is the industry-standard visual node rendering library. It handles infinite canvas pan/zoom, coordinate positioning, node drop events, and dynamic animated edge lines out of the box, avoiding the need to write custom HTML canvas rendering logic.
-
-### 4. Database & ORM: SQLite + SQLAlchemy
-*   **Zero-Dependency Local Run**: Relational mapping through SQLAlchemy allows us to represent the multi-agent graph (agents, configs, message threads, telemetry) cleanly. SQLite requires no background service setups (like PostgreSQL or MySQL), maintaining the constraint that the project must run fully locally out of the box.
-
-### 5. Web Search Agent Tool: DuckDuckGo Scraping (via beautifulsoup4)
-*   **Zero-Cost Flight Search**: Using free DuckDuckGo HTML scraping combined with Gemini synthesis allows the search agents to execute real-time flight search lookups on live web pages without incurring Google Search API costs or requiring subscription-based search engine keys.
+| Table Name | Model Class | Description |
+| :--- | :--- | :--- |
+| `agents` | `Agent` | Stores agent metadata: `name`, `role`, `system_prompt`, `goal`, target `model`, `max_tokens`, enabled `tools`, and `channels`. |
+| `agent_configs` | `AgentConfig` | Houses flexible options like `schedules`, `memory` switches, `skills` arrays, `interaction_rules`, and `guardrails`. |
+| `messages` | `Message` | Stores conversational logs partitioned by `thread_id`. Tracks `sender_type` (`human`, `agent`, `system`) and content. |
+| `telemetry_logs`| `TelemetryLog` | Captures metrics for executions: elapsed duration, input/output tokens, cost, and raw captured `terminal_log`. |
+| `workflows` | `Workflow` | Persists visual builder configurations with `nodes` and `edges` JSON blocks, and `is_active_telegram` markers. |
 
 ---
 
-## ⚡ Key Observable Implementations
+## ⚡ Step-by-Step Execution Engine & Cycles
 
-### 1. Stateless Human-in-the-Loop Engine
-Rather than using blocking console inputs (which freeze threads and break web application concurrency), the platform handles pauses and resumptions statelessly by reading the database message history:
+Instead of launching the entire multi-agent team simultaneously (which leads to concurrency conflicts, blocking threads, and makes human-in-the-loop validation impossible on the web), the platform compiles the node canvas into a sequential pipeline.
 
-* **Phase 1 (First execution, Agent Message Count = 0)**:
-  * When execution reaches a node with `requireConfirmation` enabled, the agent is instructed to detail its proposals (e.g. flight options) and ask the user to confirm their details.
+### 1. Topological Sorting & Kahn's Algorithm
+The backend runtime uses Kahn's algorithm in `topological_sort` to sort the visual React Flow nodes based on the connections (edges). This guarantees that dependent steps (e.g. ticket booking) always wait for prerequisites (e.g. flight searches) to finish first.
+
+### 2. Workflow Cycle Boundaries
+To run workflows repeatedly in the same chat thread, the system isolates runs using system boundary messages:
+* When a workflow run finishes executing all nodes, the backend appends a special system boundary message: `"--- workflow_cycle_boundary ---"`.
+* The next prompt from the user starts a fresh cycle. The runtime only reads and counts messages created *after* the latest cycle boundary.
+
+### 3. Stateless Human-in-the-Loop Engine
+The confirmation mechanism is managed statelessly by evaluating agent message counts within the current execution cycle:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant Engine as Runtime Engine
+    participant Agent as Agent (Confirmation Enabled)
+    participant DB as SQLite DB
+
+    User->>Engine: Send Initial Request
+    Note over Engine: Check Cycle Message Count: Agent Count = 0
+    Engine->>Agent: Trigger Phase 1 (Proposals & Conf. Request)
+    Agent->>DB: Save Proposals & Ask Confirmation Question
+    Agent-->>User: Return confirmation question (Execution Pauses)
+
+    Note over User, Engine: Wait State (Thread Completes, Resources Freed)
+
+    User->>Engine: Send Response ("Yes, book flight 6E-102")
+    Note over Engine: Latest message is from Human. Agent Count = 1
+    Engine->>Agent: Trigger Phase 2 (Process response & finalize booking)
+    Agent->>Agent: Run tool (e.g. book_travel_tickets)
+    Agent->>DB: Save Final Booking Output (Agent Count = 2)
+    Engine->>Engine: Proceed to next node in Topological Order
+```
+
+* **Phase 1 (Agent Message Count = 0)**:
+  * When execution reaches a node with `requireConfirmation` enabled, the agent is instructed to detail its proposals and ask the user to confirm their selection.
   * The agent saves this question to the database and the workflow **pauses** execution, returning the question to the client.
 * **Wait State**:
-  * The execution thread completes, freeing up resources. The user reviews the question on their chat client.
-* **Phase 2 (Resume execution, Agent Message Count = 1)**:
+  * The execution thread completes. The user reviews the question on their chat client (Web or Telegram).
+* **Phase 2 (Agent Message Count = 1)**:
   * The user sends their response (e.g. *"Confirm flight 6E-829, my name is Abhishek"*), inserting a new human message.
   * The runner detects that the latest message in the thread is from a human.
   * The agent runs again, instructed that the user has provided the details. It processes the response, finalizes the booking, and **continues** automatically to the next node.
+* **Skipped (Agent Message Count >= 2)**:
+  * If the agent has already executed both phases, it is skipped.
 
-### 2. Live Telemetry & Compute Cost Calculator
-Every execution gathers metadata stored in the database:
-* **Token Tracking**: Computes prompt and response tokens.
-* **Cost Ingestion**: Dynamically calculates API costs in USD based on standard rates ($0.075 per 1M input tokens, $0.30 per 1M output tokens).
-* **observability logs**: Standard output streams (`sys.stdout`) are intercepted during crewAI tasks execution. ANSI color escapes are stripped, formatting the inner agent dialogue and tool calls directly onto the web UI logs panel.
+---
+
+## 🛠️ Custom Python Tools
+
+The platform provides 5 custom python tools, declared in [runtime.py](file:///Users/abhishek/Developer/agent-orchestrator/runtime.py) and registered in `AVAILABLE_TOOLS`:
+
+1. **`get_current_time(timezone)`**: Returns the current ISO-formatted time for the requested timezone.
+2. **`search_travel_options(origin, destination, travel_date)`**: Fetches web search snippets via DuckDuckGo HTML scraping. It then invokes Gemini (`gemma-4-26b-a4b-it`) to synthesize flight options, prices, and flight codes, falling back to a dynamic mock generator if APIs are unreachable.
+3. **`book_travel_tickets(option_id, traveler_name)`**: Confirms a reservation based on the provided Option ID and returns a confirmed booking reference (`TX-XXXXXX`).
+4. **`add_to_calendar_and_itinerary(booking_id, itinerary_details)`**: Creates a structured day-by-day itinerary and schedules it on the database-simulated calendar.
+5. **`add_google_calendar_event(summary, start_time, end_time, description)`**: Formulates a direct Google Calendar template URL (`https://calendar.google.com/calendar/render?action=TEMPLATE...`), providing the user with a clickable markdown link to save the event instantly to their calendar.
+
+---
+
+## 📈 Live Telemetry & Cost Estimations
+
+Every execution records metrics in the `TelemetryLog` table:
+* **Terminal stdout Redirection**: Standard output (`sys.stdout`) is intercepted using `io.StringIO()` during `crew.kickoff()`. ANSI color escape sequences are stripped via regex `\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])` to format cleaner agent dialogue logs directly on the web UI panel.
+* **Token & Heuristic Cost Tracking**: 
+  * Prompt and response tokens are estimated heuristically based on input character length:
+    * `input_tokens = int(text_length * 0.4)`
+    * `output_tokens = int(text_length * 0.3)`
+  * Costs in USD are calculated using standard Gemini developer rates:
+    * **Input Rate**: $0.075 per 1,000,000 tokens
+    * **Output Rate**: $0.30 per 1,000,000 tokens
+    * `estimated_cost = (input_tokens / 1,000,000 * 0.075) + (output_tokens / 1,000,000 * 0.30)`
 
 ---
 
@@ -122,6 +169,7 @@ GOOGLE_API_KEY="your-provided-gemini-key"
 
 # Optional: To enable the Telegram message channel integration
 TELEGRAM_BOT_TOKEN="your-telegram-bot-token"
+TELEGRAM_ALLOWED_USERNAMES="username1,username2" # Optional: Whitelisted users
 ```
 
 ---
@@ -174,6 +222,6 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 ### How to Add a New Messaging Channel (e.g. Slack/WhatsApp)
 1. Implement a polling loop or webhook route in a new file (e.g. `slack_bot.py`), following the structure of `telegram_bot.py`.
-2. Link the received message to `execute_crewai_chat` from [runtime.py](file:///Users/abhishek/Developer/agent-orchestrator/runtime.py) for conversational execution.
+2. Link the received message to `execute_workflow_step_by_step` from [runtime.py](file:///Users/abhishek/Developer/agent-orchestrator/runtime.py) for conversational execution.
 3. Persist the human and agent response in the database using the same `models.Message` schema.
 4. Register the bot startup in `main.py` inside the `@app.on_event("startup")` handler.
